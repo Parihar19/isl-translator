@@ -1,19 +1,49 @@
 import cv2
 import mediapipe as mp
 import time
-import csv 
-import os  
+import pickle
+import pyttsx3
+import threading 
+import warnings
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# --- THE FIX: The Traffic Light ---
+is_speaking = False
+
+def speak_letter(letter):
+    global is_speaking
+    is_speaking = True # Turn light RED
+    try:
+        # Create a fresh engine for this specific speech request (Windows loves this)
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 150)
+        engine.say(letter)
+        engine.runAndWait()
+    except Exception:
+        # If Windows throws a tiny internal fit, just ignore it silently
+        pass 
+    finally:
+        is_speaking = False # Turn light GREEN again when finished talking
+
+# -----------------------------------
+
+print("Loading AI Model...")
+with open('model.pkl', 'rb') as f:
+    model = pickle.load(f)
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
-# CHANGE 1: Now tracking 2 hands
 options = HandLandmarkerOptions(
     base_options=BaseOptions(model_asset_path='hand_landmarker.task'),
     running_mode=VisionRunningMode.VIDEO, 
-    num_hands=2) 
+    num_hands=2,
+    min_hand_detection_confidence=0.7,
+    min_hand_presence_confidence=0.7,
+    min_tracking_confidence=0.7) 
 
 MY_HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),       
@@ -23,22 +53,10 @@ MY_HAND_CONNECTIONS = [
     (13, 17), (0, 17), (17, 18), (18, 19), (19, 20) 
 ]
 
-# CHANGE 2: Setup the CSV with Left (l) and Right (r) columns
-csv_file = 'isl_dataset.csv'
-if not os.path.exists(csv_file):
-    headers = ['label']
-    # 42 columns for Left Hand
-    for i in range(21):
-        headers.extend([f'lx{i}', f'ly{i}'])
-    # 42 columns for Right Hand
-    for i in range(21):
-        headers.extend([f'rx{i}', f'ry{i}'])
-    
-    with open(csv_file, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
-
 cap = cv2.VideoCapture(0)
+
+last_predicted = ""
+frames_stable = 0
 
 with HandLandmarker.create_from_options(options) as landmarker:
     while cap.isOpened():
@@ -47,25 +65,18 @@ with HandLandmarker.create_from_options(options) as landmarker:
             break
 
         h, w, c = frame.shape
-
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         timestamp_ms = int(time.time() * 1000)
         
         result = landmarker.detect_for_video(mp_image, timestamp_ms)
-        key = cv2.waitKey(1) & 0xFF
 
-        # Initialize default empty data (0.0) for both hands
-        # This prevents the CSV from breaking if only 1 hand is on screen
         hand_data = {'Left': [0.0] * 42, 'Right': [0.0] * 42}
+        predicted_letter = "?"
 
         if result.hand_landmarks and result.handedness:
-            # Loop through however many hands it sees (1 or 2)
             for idx, hand_landmarks in enumerate(result.hand_landmarks):
-                
-                # Get whether this specific hand is Left or Right
                 hand_label = result.handedness[idx][0].category_name
                 
-                # Draw the web
                 for connection in MY_HAND_CONNECTIONS:
                     start_idx = connection[0]
                     end_idx = connection[1]
@@ -73,35 +84,33 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     end_point = (int(hand_landmarks[end_idx].x * w), int(hand_landmarks[end_idx].y * h))
                     cv2.line(frame, start_point, end_point, (0, 255, 0), 2) 
                 
-                # Extract coordinates for THIS hand
                 coords = []
                 for landmark in hand_landmarks:
-                    cx = int(landmark.x * w)
-                    cy = int(landmark.y * h)
-                    cv2.circle(frame, (cx, cy), 5, (0, 0, 255), -1) 
                     coords.extend([landmark.x, landmark.y])
                 
-                # Lock the coordinates into the correct dictionary slot
                 hand_data[hand_label] = coords
 
-        # Combine Left and Right data into one massive 84-item list
-        combined_row_data = hand_data['Left'] + hand_data['Right']
+            combined_row_data = hand_data['Left'] + hand_data['Right']
+            prediction = model.predict([combined_row_data])
+            predicted_letter = prediction[0]
 
-        # Save to CSV if a letter key is pressed
-        if ord('a') <= key <= ord('z'):
-            label = chr(key).upper() 
-            row = [label] + combined_row_data
-            
-            with open(csv_file, mode='a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(row)
-                
-            print(f"Saved row for {label}")
-            cv2.putText(frame, f"SAVED {label}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 3)
+            if predicted_letter == last_predicted:
+                frames_stable += 1
+            else:
+                frames_stable = 0 
+                last_predicted = predicted_letter
 
-        cv2.imshow('ISL Two-Handed Data Collector', frame)
+            # FIXED: Only trigger speech if stable AND the traffic light is green!
+            if frames_stable >= 15 and not is_speaking:
+                threading.Thread(target=speak_letter, args=(predicted_letter,), daemon=True).start()
+                frames_stable = -15 # Cooldown
 
-        if key == ord('q'):
+        cv2.rectangle(frame, (0, 0), (250, 80), (0, 0, 0), cv2.FILLED)
+        cv2.putText(frame, f"Sign: {predicted_letter}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 4)
+
+        cv2.imshow('Live ISL Translator', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
 cap.release()
